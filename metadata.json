@@ -1,0 +1,6 @@
+{
+  "name": "AnatomiArt Studio - Tenten & Mestres da Anatomia",
+  "description": "Estudo e consulta do livro de anatomia do Tenten com tradução de termos ES->PT, busca visual por foto/câmera, prancheta para tablet e S24 Ultra com stylus, e coleções de referências.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

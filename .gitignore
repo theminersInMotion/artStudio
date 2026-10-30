@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+*.pdf
+*.ppm
+public/rendered_pages/
+public/uploaded_books/
+public/assets/aistudio/*.pdf
