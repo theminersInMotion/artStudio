@@ -727,7 +727,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 title={`Pular para Prancha #${p}`}
               >
                 <img
-                  src={`/api/pdf/page/${p}`}
+                  src={`/api/books/${activeBook?.id || 'tenten'}/page/${p}`}
                   alt={`Miniatura Pág ${p}`}
                   className="w-12 h-16 object-cover bg-zinc-950"
                   loading="lazy"

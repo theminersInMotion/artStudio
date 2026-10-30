@@ -579,45 +579,115 @@ const DEFAULT_BOOKS: StoredBook[] = [
   }
 ];
 
-function readCustomBooks(): StoredBook[] {
+interface BooksDatabase {
+  customBooks: StoredBook[];
+  bookOverrides: Record<string, Partial<StoredBook>>;
+  deletedBookIds: string[];
+}
+
+function readBooksDatabase(): BooksDatabase {
   try {
     if (fs.existsSync(booksMetadataFile)) {
-      const data = fs.readFileSync(booksMetadataFile, 'utf8');
-      return JSON.parse(data) || [];
+      const raw = fs.readFileSync(booksMetadataFile, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return { customBooks: parsed, bookOverrides: {}, deletedBookIds: [] };
+      }
+      return {
+        customBooks: Array.isArray(parsed.customBooks) ? parsed.customBooks : [],
+        bookOverrides: parsed.bookOverrides || {},
+        deletedBookIds: Array.isArray(parsed.deletedBookIds) ? parsed.deletedBookIds : []
+      };
     }
   } catch (err) {
     console.error('Error reading books.json:', err);
   }
-  return [];
+  return { customBooks: [], bookOverrides: {}, deletedBookIds: [] };
 }
 
-function saveCustomBooks(books: StoredBook[]) {
+function saveBooksDatabase(db: BooksDatabase) {
   try {
-    fs.writeFileSync(booksMetadataFile, JSON.stringify(books, null, 2), 'utf8');
+    fs.writeFileSync(booksMetadataFile, JSON.stringify(db, null, 2), 'utf8');
   } catch (err) {
     console.error('Error saving books.json:', err);
   }
 }
 
-function getAllBooks(): StoredBook[] {
-  const custom = readCustomBooks();
-  const all = [...DEFAULT_BOOKS, ...custom];
-  // Calculate hasPdfOnDisk status
-  return all.map(b => {
-    let exists = false;
-    if (b.filePath && fs.existsSync(b.filePath)) {
-      exists = true;
-    } else if (b.filename && fs.existsSync(path.resolve(uploadedBooksDir, b.filename))) {
-      exists = true;
+function clearBookCache(bookId: string) {
+  try {
+    if (!fs.existsSync(renderedPagesDir)) return;
+    const files = fs.readdirSync(renderedPagesDir);
+    for (const f of files) {
+      if (f.startsWith(`book_${bookId}_p`) || (bookId === 'tenten' && f.startsWith('page_'))) {
+        try {
+          fs.unlinkSync(path.join(renderedPagesDir, f));
+        } catch {}
+      }
     }
-    return {
-      ...b,
-      hasPdfOnDisk: exists,
-      coverImage: exists 
-        ? `/api/books/${b.id}/page/1`
-        : `/api/books/${b.id}/page/1`
-    };
+  } catch (e) {
+    console.warn('Error clearing book cache:', e);
+  }
+}
+
+function renderCoverPage(bookId: string, filePath: string) {
+  const coverPath = path.join(renderedPagesDir, `book_${bookId}_p1.jpg`);
+  const args = [
+    '-dNOPAUSE',
+    '-dBATCH',
+    '-sDEVICE=jpeg',
+    '-dJPEGQ=85',
+    '-r150',
+    '-dFirstPage=1',
+    '-dLastPage=1',
+    `-sOutputFile=${coverPath}`,
+    filePath
+  ];
+  execFile('gs', args, { timeout: 15000 }, (err) => {
+    if (err) {
+      console.warn(`Could not extract page 1 cover thumbnail for ${bookId}:`, err);
+    }
   });
+}
+
+function getAllBooks(): StoredBook[] {
+  const db = readBooksDatabase();
+  const deletedSet = new Set(db.deletedBookIds || []);
+
+  const defaultList: StoredBook[] = DEFAULT_BOOKS
+    .filter(b => !deletedSet.has(b.id))
+    .map(b => {
+      const override = db.bookOverrides[b.id] || {};
+      const merged: StoredBook = { ...b, ...override };
+      let exists = false;
+      if (merged.filePath && fs.existsSync(merged.filePath)) {
+        exists = true;
+      } else if (merged.filename && fs.existsSync(path.resolve(uploadedBooksDir, merged.filename))) {
+        exists = true;
+      }
+      return {
+        ...merged,
+        hasPdfOnDisk: exists,
+        coverImage: `/api/books/${b.id}/page/1`
+      };
+    });
+
+  const customList: StoredBook[] = (db.customBooks || [])
+    .filter(b => !deletedSet.has(b.id))
+    .map(b => {
+      let exists = false;
+      if (b.filePath && fs.existsSync(b.filePath)) {
+        exists = true;
+      } else if (b.filename && fs.existsSync(path.resolve(uploadedBooksDir, b.filename))) {
+        exists = true;
+      }
+      return {
+        ...b,
+        hasPdfOnDisk: exists,
+        coverImage: `/api/books/${b.id}/page/1`
+      };
+    });
+
+  return [...defaultList, ...customList];
 }
 
 // In-flight renders map to avoid redundant duplicate Ghostscript calls
@@ -807,7 +877,7 @@ app.get('/api/books', (_req, res) => {
   return res.json(books);
 });
 
-// 2. Upload New Art Book (PDF sem limite de tamanho)
+// 2. Upload Art Book or Attach PDF to Existing Book (Universal / Sem limite de tamanho)
 app.post('/api/books/upload', uploadBookMiddleware.single('file'), async (req, res) => {
   try {
     const file = req.file;
@@ -816,37 +886,121 @@ app.post('/api/books/upload', uploadBookMiddleware.single('file'), async (req, r
     }
 
     const { title, artist, language, description } = req.body;
+    let targetBookId = (req.body.targetBookId || '').trim();
+
+    // Auto-detect target book if not explicitly specified
+    if (!targetBookId || targetBookId === 'auto') {
+      const checkStr = (file.originalname + ' ' + (title || '')).toLowerCase();
+      if (checkStr.includes('tenten')) {
+        targetBookId = 'tenten';
+      } else if (checkStr.includes('loomis')) {
+        targetBookId = 'loomis';
+      } else if (checkStr.includes('bridgman')) {
+        targetBookId = 'bridgman';
+      }
+    }
+
+    // Calculate total pages via Ghostscript
+    const totalPages = await getPdfPageCount(file.path);
+    const db = readBooksDatabase();
+
+    // Clear old rendered page cache for this book ID so newly uploaded pages take effect immediately
+    if (targetBookId) {
+      clearBookCache(targetBookId);
+    }
+
+    // A. Check if target is a DEFAULT book (like 'tenten', 'loomis', 'bridgman')
+    const defaultBook = DEFAULT_BOOKS.find(b => b.id === targetBookId);
+    if (defaultBook) {
+      const bookTitle = title?.trim() || defaultBook.title;
+      const bookArtist = artist?.trim() || defaultBook.artist;
+      const bookLang = language?.trim() || defaultBook.language || 'Espanhol';
+      const bookDesc = description?.trim() || defaultBook.description || '';
+
+      db.bookOverrides[targetBookId] = {
+        title: bookTitle,
+        artist: bookArtist,
+        language: bookLang,
+        description: bookDesc,
+        filename: file.filename,
+        filePath: file.path,
+        fileSize: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+        totalPages: totalPages > 0 ? totalPages : defaultBook.totalPages,
+        hasPdfOnDisk: true,
+        uploadedAt: new Date().toISOString()
+      };
+
+      // Unhide if previously marked deleted
+      db.deletedBookIds = (db.deletedBookIds || []).filter(id => id !== targetBookId);
+      saveBooksDatabase(db);
+      renderCoverPage(targetBookId, file.path);
+
+      const all = getAllBooks();
+      const updated = all.find(b => b.id === targetBookId) || {
+        ...defaultBook,
+        ...db.bookOverrides[targetBookId],
+        hasPdfOnDisk: true,
+        coverImage: `/api/books/${targetBookId}/page/1`
+      };
+
+      return res.json({
+        success: true,
+        book: updated,
+        isExistingBook: true,
+        message: `Arquivo PDF vinculado com sucesso à obra "${bookTitle}" do mestre ${bookArtist} (${totalPages} páginas)!`
+      });
+    }
+
+    // B. Check if target is an EXISTING custom book
+    const existingCustomIndex = (db.customBooks || []).findIndex(b => b.id === targetBookId);
+    if (existingCustomIndex !== -1 && targetBookId !== 'new') {
+      const existing = db.customBooks[existingCustomIndex];
+      // Clean previous file if existed
+      if (existing.filename && existing.filename !== file.filename) {
+        const oldFile = path.resolve(uploadedBooksDir, existing.filename);
+        if (fs.existsSync(oldFile)) {
+          try { fs.unlinkSync(oldFile); } catch (e) {}
+        }
+      }
+
+      const updatedCustom: StoredBook = {
+        ...existing,
+        title: title?.trim() || existing.title,
+        artist: artist?.trim() || existing.artist,
+        language: language?.trim() || existing.language || 'Português',
+        description: description?.trim() || existing.description || '',
+        filename: file.filename,
+        filePath: file.path,
+        fileSize: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+        totalPages: totalPages > 0 ? totalPages : existing.totalPages,
+        hasPdfOnDisk: true,
+        uploadedAt: new Date().toISOString(),
+        coverImage: `/api/books/${targetBookId}/page/1`
+      };
+
+      db.customBooks[existingCustomIndex] = updatedCustom;
+      saveBooksDatabase(db);
+      renderCoverPage(targetBookId, file.path);
+
+      return res.json({
+        success: true,
+        book: updatedCustom,
+        isExistingBook: true,
+        message: `PDF do livro "${updatedCustom.title}" atualizado com sucesso (${totalPages} páginas)!`
+      });
+    }
+
+    // C. Otherwise, create a NEW custom book
     const bookTitle = title?.trim() || file.originalname.replace(/\.[^/.]+$/, '');
     const bookArtist = artist?.trim() || 'Artista Convidado';
     const bookLang = language?.trim() || 'Português';
     const bookDesc = description?.trim() || `Livro de arte "${bookTitle}" adicionado pelo usuário.`;
+    const newBookId = 'book_' + Date.now();
 
-    // Calculate total pages via Ghostscript
-    const totalPages = await getPdfPageCount(file.path);
-    const bookId = 'book_' + Date.now();
-
-    // Render page 1 cover image
-    const coverPath = path.join(renderedPagesDir, `book_${bookId}_p1.jpg`);
-    const args = [
-      '-dNOPAUSE',
-      '-dBATCH',
-      '-sDEVICE=jpeg',
-      '-dJPEGQ=85',
-      '-r150',
-      '-dFirstPage=1',
-      '-dLastPage=1',
-      `-sOutputFile=${coverPath}`,
-      file.path
-    ];
-
-    execFile('gs', args, { timeout: 15000 }, (err) => {
-      if (err) {
-        console.warn('Could not extract page 1 cover thumbnail:', err);
-      }
-    });
+    renderCoverPage(newBookId, file.path);
 
     const newBook: StoredBook = {
-      id: bookId,
+      id: newBookId,
       title: bookTitle,
       artist: bookArtist,
       totalPages: totalPages,
@@ -859,17 +1013,17 @@ app.post('/api/books/upload', uploadBookMiddleware.single('file'), async (req, r
       language: bookLang,
       tags: ['Upload Personalizado', bookArtist, bookLang],
       hasPdfOnDisk: true,
-      coverImage: `/api/books/${bookId}/page/1`
+      coverImage: `/api/books/${newBookId}/page/1`
     };
 
-    const currentCustom = readCustomBooks();
-    currentCustom.unshift(newBook);
-    saveCustomBooks(currentCustom);
+    db.customBooks.unshift(newBook);
+    saveBooksDatabase(db);
 
     return res.json({
       success: true,
       book: newBook,
-      message: `Livro "${bookTitle}" com ${totalPages} páginas carregado com sucesso!`
+      isExistingBook: false,
+      message: `Novo livro "${bookTitle}" com ${totalPages} páginas adicionado à biblioteca!`
     });
   } catch (error: any) {
     console.error('Error uploading book:', error);
@@ -877,32 +1031,82 @@ app.post('/api/books/upload', uploadBookMiddleware.single('file'), async (req, r
   }
 });
 
-// 3. Delete Custom Art Book
+// 3. Delete Book or Remove Attached PDF
 app.delete('/api/books/:bookId', (req, res) => {
   const { bookId } = req.params;
-  const currentCustom = readCustomBooks();
-  const bookToDelete = currentCustom.find(b => b.id === bookId);
+  const db = readBooksDatabase();
+  clearBookCache(bookId);
 
-  if (!bookToDelete) {
-    return res.status(404).json({ error: 'Livro não encontrado ou é um livro padrão do sistema.' });
-  }
+  // Check if it's a default book (like 'tenten', 'loomis', 'bridgman')
+  const isDefaultBook = DEFAULT_BOOKS.some(b => b.id === bookId);
 
-  // Delete physical file if exists
-  if (bookToDelete.filename) {
-    const fullPath = path.resolve(uploadedBooksDir, bookToDelete.filename);
-    if (fs.existsSync(fullPath)) {
-      try {
-        fs.unlinkSync(fullPath);
-      } catch (e) {
-        console.warn('Could not unlink book file:', e);
+  if (isDefaultBook) {
+    const override = db.bookOverrides[bookId];
+    if (override?.filename) {
+      const fullPath = path.resolve(uploadedBooksDir, override.filename);
+      if (fs.existsSync(fullPath)) {
+        try { fs.unlinkSync(fullPath); } catch (e) {}
       }
     }
+    delete db.bookOverrides[bookId];
+
+    // If query ?action=resetPdf, just remove the uploaded PDF, keep the book in library
+    if (req.query.action === 'resetPdf') {
+      saveBooksDatabase(db);
+      return res.json({
+        success: true,
+        action: 'resetPdf',
+        message: 'Arquivo PDF do livro removido. O livro voltou para o modo de pranchas interativas.'
+      });
+    }
+
+    // Otherwise, remove book from library
+    if (!db.deletedBookIds.includes(bookId)) {
+      db.deletedBookIds.push(bookId);
+    }
+    saveBooksDatabase(db);
+    return res.json({
+      success: true,
+      action: 'deleted',
+      message: 'Livro removido da sua biblioteca com sucesso.'
+    });
   }
 
-  const updated = currentCustom.filter(b => b.id !== bookId);
-  saveCustomBooks(updated);
+  // Custom Book Deletion
+  const customIdx = (db.customBooks || []).findIndex(b => b.id === bookId);
+  if (customIdx !== -1) {
+    const bookToDelete = db.customBooks[customIdx];
+    if (bookToDelete.filename) {
+      const fullPath = path.resolve(uploadedBooksDir, bookToDelete.filename);
+      if (fs.existsSync(fullPath)) {
+        try { fs.unlinkSync(fullPath); } catch (e) {}
+      }
+    }
+    db.customBooks.splice(customIdx, 1);
+  }
 
-  return res.json({ success: true, message: 'Livro removido com sucesso.' });
+  if (!db.deletedBookIds.includes(bookId)) {
+    db.deletedBookIds.push(bookId);
+  }
+  saveBooksDatabase(db);
+
+  return res.json({
+    success: true,
+    action: 'deleted',
+    message: 'Livro excluído com sucesso da biblioteca.'
+  });
+});
+
+// 4. Restore Default Curated Books
+app.post('/api/books/restore-defaults', (_req, res) => {
+  const db = readBooksDatabase();
+  db.deletedBookIds = db.deletedBookIds.filter(id => !DEFAULT_BOOKS.some(b => b.id === id));
+  saveBooksDatabase(db);
+  return res.json({
+    success: true,
+    books: getAllBooks(),
+    message: 'Livros padrão restaurados com sucesso!'
+  });
 });
 
 // 4. Render or Serve Page for Any Book (Universal)

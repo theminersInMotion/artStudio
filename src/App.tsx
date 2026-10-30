@@ -198,19 +198,28 @@ export default function App() {
           setCanvasReferenceImage(`/api/books/${book.id}/page/1`);
           setActiveTab('reader');
         }}
-        onBookUploaded={(newBook) => {
-          setBooks(prev => [newBook, ...prev.filter(b => b.id !== newBook.id)]);
-          setActiveBook(newBook);
+        onBookUploaded={(uploadedBook) => {
+          setBooks(prev => {
+            const exists = prev.some(b => b.id === uploadedBook.id);
+            if (exists) {
+              return prev.map(b => b.id === uploadedBook.id ? uploadedBook : b);
+            }
+            return [uploadedBook, ...prev];
+          });
+          setActiveBook(uploadedBook);
           setCurrentReaderPage(1);
           setCanvasReferencePage(1);
-          setCanvasReferenceImage(`/api/books/${newBook.id}/page/1`);
+          setCanvasReferenceImage(`/api/books/${uploadedBook.id}/page/1?t=${Date.now()}`);
           setActiveTab('reader');
         }}
         onBookDeleted={(deletedId) => {
-          setBooks(prev => prev.filter(b => b.id !== deletedId));
-          if (activeBook?.id === deletedId) {
-            setActiveBook(books.find(b => b.id !== deletedId) || null);
-          }
+          setBooks(prev => {
+            const updated = prev.filter(b => b.id !== deletedId);
+            if (activeBook?.id === deletedId) {
+              setActiveBook(updated[0] || null);
+            }
+            return updated;
+          });
         }}
       />
 
