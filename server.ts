@@ -1029,22 +1029,31 @@ app.use('/pdf.worker.min.js', express.static(path.resolve(__dirname, 'public/pdf
 
 // Configure Vite middleware in development or static server in production
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
+  const distDir = path.resolve(__dirname, 'dist');
+  const distIndexPath = path.resolve(distDir, 'index.html');
+
+  if (process.env.NODE_ENV === 'production' && fs.existsSync(distIndexPath)) {
+    console.log(`[Production] Serving static files from: ${distDir}`);
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      res.sendFile(distIndexPath);
+    });
+  } else {
+    if (process.env.NODE_ENV === 'production') {
+      console.warn(`[Production Notice] dist/index.html was not found at ${distIndexPath}. Starting Vite middleware dynamically so the app stays online and fully operational without ENOENT errors.`);
+    } else {
+      console.log('[Development] Starting Vite middleware mode...');
+    }
     const { createServer } = await import('vite');
     const vite = await createServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
-    });
   }
 
   app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log(`Server listening on port ${PORT} (NODE_ENV=${process.env.NODE_ENV || 'development'})`);
   });
 }
 
