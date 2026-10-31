@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import * as pdfjsLib from 'pdfjs-dist';
 import { 
   ChevronLeft, 
   ChevronRight, 
@@ -25,7 +26,9 @@ import {
   Sliders,
   Eye,
   ArrowRight,
-  Grid
+  Grid,
+  UploadCloud,
+  FileCheck
 } from 'lucide-react';
 import { 
   TENTEN_PDF_PATH, 
@@ -33,6 +36,12 @@ import {
   TENTEN_CHAPTERS 
 } from '../data/tentenIndex.ts';
 import { StylisticAnalysis, ArtBook } from '../types/anatomy.ts';
+import { getPdfFromIndexedDb, savePdfToIndexedDb } from '../utils/pdfStorage.ts';
+
+// Set PDF.js worker from same origin
+if (typeof window !== 'undefined') {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
+}
 
 interface TentenReaderProps {
   initialPage?: number;
@@ -54,44 +63,239 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
   onOpenCanvasWithReference
 }) => {
   const [currentPage, setCurrentPage] = useState<number>(initialPage);
-  const totalPages = activeBook?.totalPages || TENTEN_TOTAL_PAGES;
   const [fitMode, setFitMode] = useState<FitMode>('fit-screen');
   const [zoomPercent, setZoomPercent] = useState<number>(100);
   const [isRenderingPage, setIsRenderingPage] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // When active book changes, reset to page 1
+  // PDF.js Engine State
+  const [pdfDoc, setPdfDoc] = useState<any | null>(null);
+  const [isPdfLoading, setIsPdfLoading] = useState<boolean>(false);
+  const [pdfSourceType, setPdfSourceType] = useState<'indexedDb' | 'server' | 'none'>('none');
+  const [docPageCount, setDocPageCount] = useState<number>(activeBook?.totalPages || TENTEN_TOTAL_PAGES);
+
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const renderTaskRef = useRef<any | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const quickFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const totalPages = pdfDoc?.numPages || docPageCount || activeBook?.totalPages || 537;
+
+  // When active book changes, reset state
   useEffect(() => {
     if (activeBook) {
       setCurrentPage(1);
       setPageAnalysis(null);
       setErrorMsg(null);
+      setDocPageCount(activeBook.totalPages || 537);
     }
   }, [activeBook?.id]);
 
-  // PDF Source & Viewing Mode
-  const [pdfSourceUrl, setPdfSourceUrl] = useState<string>(() => {
-    return localStorage.getItem('anatomiart_pdf_url') || TENTEN_PDF_PATH;
-  });
-  const [viewMode, setViewMode] = useState<'canvas' | 'native'>('canvas');
-  const [showSourceConfigModal, setShowSourceConfigModal] = useState<boolean>(false);
-  const [customUrlInput, setCustomUrlInput] = useState<string>('');
-  const [showThumbStrip, setShowThumbStrip] = useState<boolean>(true);
+  // Load PDF Document for current activeBook (checking local IndexedDB first, then server stream)
+  useEffect(() => {
+    let isMounted = true;
+    const bookId = activeBook?.id || 'tenten';
 
-  // AI Page Analysis State
+    async function loadPdfDocument() {
+      setIsPdfLoading(true);
+
+      // 1. Check local IndexedDB storage (instant 0ms loading from previous upload)
+      try {
+        const cachedBlob = await getPdfFromIndexedDb(bookId);
+        if (cachedBlob && isMounted) {
+          const arrayBuffer = await cachedBlob.arrayBuffer();
+          const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+          const doc = await loadingTask.promise;
+          if (isMounted) {
+            setPdfDoc(doc);
+            setPdfSourceType('indexedDb');
+            setDocPageCount(doc.numPages);
+            setIsPdfLoading(false);
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn(`[PDF.js] IndexedDB load attempt for ${bookId}:`, err);
+      }
+
+      // 2. Stream from server endpoint /api/books/:bookId/pdf (with byte-range support)
+      try {
+        const streamUrl = `/api/books/${bookId}/pdf`;
+        const loadingTask = pdfjsLib.getDocument({
+          url: streamUrl,
+          rangeChunkSize: 128 * 1024,
+          disableAutoFetch: true,
+          disableStream: false,
+        });
+        const doc = await loadingTask.promise;
+        if (isMounted) {
+          setPdfDoc(doc);
+          setPdfSourceType('server');
+          setDocPageCount(doc.numPages);
+          setIsPdfLoading(false);
+          return;
+        }
+      } catch (err: any) {
+        // Book does not have raw PDF yet on server
+      }
+
+      if (isMounted) {
+        setPdfDoc(null);
+        setPdfSourceType('none');
+        setIsPdfLoading(false);
+      }
+    }
+
+    loadPdfDocument();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [activeBook?.id, activeBook?.hasPdfOnDisk]);
+
+  // Render current page onto Canvas using PDF.js
+  useEffect(() => {
+    if (!pdfDoc) return;
+    let isCancelled = false;
+
+    async function renderPdfPage() {
+      try {
+        setIsRenderingPage(true);
+        setErrorMsg(null);
+
+        // Cancel in-flight render task
+        if (renderTaskRef.current) {
+          try {
+            renderTaskRef.current.cancel();
+          } catch {}
+        }
+
+        const clamped = Math.max(1, Math.min(pdfDoc.numPages, currentPage));
+        const page = await pdfDoc.getPage(clamped);
+        if (isCancelled) return;
+
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        // Device Pixel Ratio for retina clarity
+        const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+        const baseViewport = page.getViewport({ scale: 1.0 });
+
+        let targetScale = 1.2;
+        if (fitMode === 'fit-screen') {
+          const containerHeight = (containerRef.current?.clientHeight || 800) - 60;
+          targetScale = Math.max(0.7, containerHeight / baseViewport.height);
+        } else if (fitMode === 'fit-width') {
+          const containerWidth = (containerRef.current?.clientWidth || 900) - 40;
+          targetScale = Math.max(0.7, containerWidth / baseViewport.width);
+        } else if (fitMode === 'custom-zoom') {
+          targetScale = (zoomPercent / 100) * 1.3;
+        }
+
+        const scaledViewport = page.getViewport({ scale: targetScale * dpr });
+        canvas.width = scaledViewport.width;
+        canvas.height = scaledViewport.height;
+        canvas.style.width = `${scaledViewport.width / dpr}px`;
+        canvas.style.height = `${scaledViewport.height / dpr}px`;
+
+        const renderContext = {
+          canvasContext: ctx,
+          viewport: scaledViewport,
+        };
+
+        const renderTask = page.render(renderContext);
+        renderTaskRef.current = renderTask;
+
+        await renderTask.promise;
+        if (!isCancelled) {
+          setIsRenderingPage(false);
+        }
+      } catch (err: any) {
+        if (err?.name !== 'RenderingCancelledException') {
+          console.error('[PDF.js] Render error:', err);
+          setIsRenderingPage(false);
+        }
+      }
+    }
+
+    renderPdfPage();
+
+    return () => {
+      isCancelled = true;
+      if (renderTaskRef.current) {
+        try {
+          renderTaskRef.current.cancel();
+        } catch {}
+      }
+    };
+  }, [pdfDoc, currentPage, fitMode, zoomPercent]);
+
+  // Handle Quick Direct Drag & Drop of PDF directly onto reader
+  const handleQuickDropPdf = async (e: React.DragEvent) => {
+    e.preventDefault();
+    if (!e.dataTransfer.files || !e.dataTransfer.files[0]) return;
+    const file = e.dataTransfer.files[0];
+    if (!file.name.toLowerCase().endsWith('.pdf')) return;
+
+    await processDirectPdfFile(file);
+  };
+
+  const processDirectPdfFile = async (file: File) => {
+    const bookId = activeBook?.id || 'tenten';
+    setIsPdfLoading(true);
+
+    try {
+      // 1. Immediately cache in IndexedDB
+      await savePdfToIndexedDb(bookId, file);
+
+      // 2. Load into PDF.js
+      const arrayBuffer = await file.arrayBuffer();
+      const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+      const doc = await loadingTask.promise;
+      setPdfDoc(doc);
+      setPdfSourceType('indexedDb');
+      setDocPageCount(doc.numPages);
+      setCurrentPage(1);
+
+      // 3. Asynchronously upload to server so it persists on disk
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('targetBookId', bookId);
+      formData.append('title', activeBook?.title || file.name.replace(/\.[^/.]+$/, ''));
+      formData.append('artist', activeBook?.artist || 'Tenten');
+      formData.append('language', activeBook?.language || 'Español');
+
+      fetch('/api/books/upload', {
+        method: 'POST',
+        body: formData,
+      }).then(r => r.json()).then(data => {
+        if (data.book && onSelectBook) {
+          onSelectBook(data.book);
+        }
+      }).catch(err => console.warn('Background server sync:', err));
+
+    } catch (err: any) {
+      console.error('Failed to process dropped PDF:', err);
+      setErrorMsg('Falha ao processar o arquivo PDF: ' + err.message);
+    } finally {
+      setIsPdfLoading(false);
+    }
+  };
+
+  // Filmstrip & Analysis
+  const [showThumbStrip, setShowThumbStrip] = useState<boolean>(true);
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [pageAnalysis, setPageAnalysis] = useState<any | null>(null);
   const [showAnalysisPanel, setShowAnalysisPanel] = useState<boolean>(false);
-
-  const imageRef = useRef<HTMLImageElement | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
 
   // Current Chapter
   const currentChapter = TENTEN_CHAPTERS.find(
     ch => currentPage >= ch.startPage && currentPage <= ch.endPage
   ) || TENTEN_CHAPTERS[0];
 
-  // Jump to specific page
   const handlePageChange = (newPage: number) => {
     const clamped = Math.max(1, Math.min(totalPages, newPage));
     setCurrentPage(clamped);
@@ -102,7 +306,6 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
   // Keyboard Navigation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't intercept if user is typing in an input
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement)?.tagName)) {
         return;
       }
@@ -125,8 +328,20 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [currentPage, totalPages]);
 
-  // Image URL for current page (universal art book endpoint)
   const pageSrc = `/api/books/${activeBook?.id || 'tenten'}/page/${currentPage}`;
+
+  // Direct practice on stylus canvas
+  const handleOpenCanvas = () => {
+    let dataUrlToSend: string | undefined = undefined;
+    if (pdfDoc && canvasRef.current) {
+      try {
+        dataUrlToSend = canvasRef.current.toDataURL('image/jpeg', 0.92);
+      } catch (e) {
+        console.warn('Could not extract canvas dataUrl:', e);
+      }
+    }
+    onOpenCanvasWithReference(currentPage, dataUrlToSend || pageSrc);
+  };
 
   // Trigger Gemini AI Page Analysis
   const handleAnalyzePage = async () => {
@@ -190,11 +405,6 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
     }
   };
 
-  // Direct practice action
-  const handleOpenCanvas = () => {
-    onOpenCanvasWithReference(currentPage, pageSrc);
-  };
-
   // Calculate nearby thumbnail pages for filmstrip
   const thumbWindowSize = 5;
   const startThumb = Math.max(1, currentPage - thumbWindowSize);
@@ -204,15 +414,31 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
     nearbyPages.push(p);
   }
 
+  const hasLoadedPdf = pdfDoc !== null;
+
   return (
-    <div className="flex-1 flex flex-col h-[calc(100vh-4rem)] bg-zinc-950 text-zinc-100 overflow-hidden select-none">
-      
+    <div 
+      className="flex-1 flex flex-col h-[calc(100vh-4rem)] bg-zinc-950 text-zinc-100 overflow-hidden select-none"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={handleQuickDropPdf}
+    >
+      <input
+        type="file"
+        ref={quickFileInputRef}
+        accept="application/pdf"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files[0]) {
+            processDirectPdfFile(e.target.files[0]);
+          }
+        }}
+      />
+
       {/* Top Interactive Bar */}
       <div className="bg-zinc-900 border-b border-zinc-800 p-2.5 px-3 sm:px-5 flex flex-wrap items-center justify-between gap-3 shrink-0 shadow-md">
         
-        {/* Left: Active Book Selector & Chapter Jump */}
+        {/* Left: Active Book Selector & Status Badge */}
         <div className="flex items-center gap-2 max-w-full sm:max-w-md lg:max-w-xl">
-          {/* Active Book Switcher */}
           <div className="flex items-center gap-1.5 bg-zinc-800/90 border border-zinc-700 rounded-xl px-2.5 py-1 text-xs">
             <BookOpen className="w-3.5 h-3.5 text-orange-400 shrink-0" />
             <select
@@ -223,7 +449,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                   onSelectBook(selected);
                 }
               }}
-              className="bg-transparent text-zinc-100 font-semibold focus:outline-none cursor-pointer max-w-[140px] sm:max-w-[180px] truncate"
+              className="bg-transparent text-zinc-100 font-semibold focus:outline-none cursor-pointer max-w-[130px] sm:max-w-[170px] truncate"
               title="Alternar Livro de Arte Ativo"
             >
               {allBooks.map(b => (
@@ -232,24 +458,42 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 </option>
               ))}
             </select>
+            
             <button
               onClick={onOpenLibrary}
-              className="text-[10px] font-bold text-orange-400 hover:text-orange-300 ml-1 px-1.5 py-0.5 rounded bg-orange-950/60 border border-orange-800/50 hover:bg-orange-900/60 transition-colors shrink-0"
+              className="text-[10px] font-bold text-orange-400 hover:text-orange-300 ml-1 px-1.5 py-0.5 rounded bg-orange-950/60 border border-orange-800/50 hover:bg-orange-900/60 transition-colors shrink-0 cursor-pointer"
               title="Abrir Biblioteca Completa & Fazer Upload de PDF"
             >
               + Upload
             </button>
           </div>
 
-          {/* Chapter Selector (Tenten or custom quarters) */}
-          {activeBook?.id === 'tenten' ? (
+          {/* Engine Status Badge */}
+          {hasLoadedPdf ? (
+            <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-950/80 border border-emerald-700/60 text-[10px] font-semibold text-emerald-300">
+              <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+              <span>PDF Original Ativo ({totalPages} Págs)</span>
+            </span>
+          ) : (
+            <button
+              onClick={() => quickFileInputRef.current?.click()}
+              className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-amber-950/50 hover:bg-amber-900/50 border border-amber-800/60 text-[10px] font-medium text-amber-300 transition-colors cursor-pointer"
+              title="Clique para carregar o arquivo PDF e ver todas as pranchas escaneadas"
+            >
+              <UploadCloud className="w-3 h-3 text-amber-400" />
+              <span>Modo Estudo (Clique para Carregar PDF)</span>
+            </button>
+          )}
+
+          {/* Chapter Selector */}
+          {activeBook?.id === 'tenten' && (
             <select
               value={currentChapter.id}
               onChange={(e) => {
                 const ch = TENTEN_CHAPTERS.find(item => item.id === e.target.value);
                 if (ch) handlePageChange(ch.startPage);
               }}
-              className="bg-zinc-800 hover:bg-zinc-750 border border-zinc-700 text-xs rounded-xl px-2 py-1 text-zinc-200 focus:outline-none focus:border-orange-500 font-medium truncate cursor-pointer transition-colors max-w-[140px] sm:max-w-[200px]"
+              className="bg-zinc-800 hover:bg-zinc-750 border border-zinc-700 text-xs rounded-xl px-2 py-1 text-zinc-200 focus:outline-none focus:border-orange-500 font-medium truncate cursor-pointer transition-colors max-w-[130px] sm:max-w-[180px]"
               title="Pular para um Capítulo do Livro"
             >
               {TENTEN_CHAPTERS.map(ch => (
@@ -258,39 +502,15 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 </option>
               ))}
             </select>
-          ) : (
-            <span className="text-xs text-zinc-400 font-mono hidden sm:inline">
-              {activeBook?.artist || 'Mestre'} • {totalPages} páginas
-            </span>
-          )}
-
-          {/* Quick jump to key plates of current chapter */}
-          {activeBook?.id === 'tenten' && (
-            <div className="hidden 2xl:flex items-center gap-1">
-              <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-semibold mr-1">Pranchas:</span>
-              {currentChapter.recommendedPages.map(page => (
-                <button
-                  key={page}
-                  onClick={() => handlePageChange(page)}
-                  className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-all ${
-                    currentPage === page 
-                      ? 'bg-orange-600 text-white font-bold shadow-sm' 
-                      : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'
-                  }`}
-                >
-                  #{page}
-                </button>
-              ))}
-            </div>
           )}
         </div>
 
-        {/* Center: Fluid Navigation Controls & Quick Input */}
+        {/* Center: Fluid Navigation Controls */}
         <div className="flex items-center gap-1.5">
           <button
             onClick={() => handlePageChange(currentPage - 10)}
             disabled={currentPage <= 10}
-            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
             title="Voltar 10 Páginas"
           >
             <ChevronsLeft className="w-4 h-4" />
@@ -299,7 +519,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
           <button
             onClick={() => handlePageChange(currentPage - 1)}
             disabled={currentPage <= 1}
-            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
             title="Página Anterior (Seta Esquerda)"
           >
             <ChevronLeft className="w-4 h-4" />
@@ -325,7 +545,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
           <button
             onClick={() => handlePageChange(currentPage + 1)}
             disabled={currentPage >= totalPages}
-            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
             title="Próxima Página (Seta Direita)"
           >
             <ChevronRight className="w-4 h-4" />
@@ -334,14 +554,14 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
           <button
             onClick={() => handlePageChange(currentPage + 10)}
             disabled={currentPage >= totalPages - 10}
-            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+            className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-750 text-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
             title="Avançar 10 Páginas"
           >
             <ChevronsRight className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Right: View Mode, Zoom & Actions */}
+        {/* Right: Zoom & Practice Actions */}
         <div className="flex items-center gap-2">
           
           {/* Fit Mode Switcher */}
@@ -351,7 +571,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 setFitMode('fit-screen');
                 setZoomPercent(100);
               }}
-              className={`px-2.5 py-1 rounded-lg font-medium transition-all ${
+              className={`px-2.5 py-1 rounded-lg font-medium transition-all cursor-pointer ${
                 fitMode === 'fit-screen'
                   ? 'bg-orange-600 text-white shadow-sm font-semibold'
                   : 'text-zinc-400 hover:text-zinc-200'
@@ -365,12 +585,12 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 setFitMode('fit-width');
                 setZoomPercent(100);
               }}
-              className={`px-2.5 py-1 rounded-lg font-medium transition-all ${
+              className={`px-2.5 py-1 rounded-lg font-medium transition-all cursor-pointer ${
                 fitMode === 'fit-width'
                   ? 'bg-orange-600 text-white shadow-sm font-semibold'
                   : 'text-zinc-400 hover:text-zinc-200'
               }`}
-              title="Ajustar à Largura (Para ler textos pequenos)"
+              title="Ajustar à Largura (Para ler textos e detalhes)"
             >
               Largura Total
             </button>
@@ -383,7 +603,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 setFitMode('custom-zoom');
                 setZoomPercent(z => Math.max(50, z - 20));
               }}
-              className="p-1.5 text-zinc-400 hover:text-zinc-100 rounded-lg hover:bg-zinc-700"
+              className="p-1.5 text-zinc-400 hover:text-zinc-100 rounded-lg hover:bg-zinc-700 cursor-pointer"
               title="Diminuir Zoom"
             >
               <ZoomOut className="w-3.5 h-3.5" />
@@ -396,7 +616,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 setFitMode('custom-zoom');
                 setZoomPercent(z => Math.min(300, z + 20));
               }}
-              className="p-1.5 text-zinc-400 hover:text-zinc-100 rounded-lg hover:bg-zinc-700"
+              className="p-1.5 text-zinc-400 hover:text-zinc-100 rounded-lg hover:bg-zinc-700 cursor-pointer"
               title="Aumentar Zoom"
             >
               <ZoomIn className="w-3.5 h-3.5" />
@@ -406,7 +626,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
           {/* Practice on Stylus Canvas Button */}
           <button
             onClick={handleOpenCanvas}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-orange-950/40 active:scale-95"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-orange-950/40 active:scale-95 cursor-pointer"
             title="Transferir esta prancha para a prancheta de desenho com S-Pen / Stylus"
           >
             <PenTool className="w-3.5 h-3.5" />
@@ -422,7 +642,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 setShowAnalysisPanel(!showAnalysisPanel);
               }
             }}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border transition-all ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border transition-all cursor-pointer ${
               showAnalysisPanel
                 ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 shadow-sm'
                 : 'bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-750'
@@ -430,7 +650,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
             title="Consultar termos anatômicos em espanhol e tradução para português"
           >
             <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden md:inline">Analisar com IA</span>
+            <span className="hidden md:inline">Análise IA</span>
           </button>
         </div>
       </div>
@@ -443,10 +663,33 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
           ref={containerRef}
           className="flex-1 overflow-auto bg-zinc-950/90 flex flex-col items-center justify-center p-2 sm:p-4 relative"
         >
-          {isRenderingPage && (
+          {(isRenderingPage || isPdfLoading) && (
             <div className="absolute inset-0 z-30 bg-black/40 backdrop-blur-[2px] flex flex-col items-center justify-center gap-2">
               <Loader2 className="w-8 h-8 animate-spin text-orange-500" />
-              <span className="text-xs text-zinc-300 font-medium">Carregando prancha #{currentPage}...</span>
+              <span className="text-xs text-zinc-300 font-medium">
+                {isPdfLoading ? 'Inicializando páginas do livro...' : `Carregando prancha #${currentPage}...`}
+              </span>
+            </div>
+          )}
+
+          {/* Quick Upload Notification Banner if PDF is absent */}
+          {!hasLoadedPdf && !isPdfLoading && (
+            <div className="mb-2 px-3 py-2 bg-orange-950/60 border border-orange-800/80 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs text-orange-200 w-full max-w-4xl shrink-0 shadow-lg animate-in fade-in">
+              <div className="flex items-center gap-2">
+                <Info className="w-4 h-4 text-orange-400 shrink-0" />
+                <span>
+                  Visualizando pranchas de estudo demonstrativas. Carregue o arquivo PDF completo de <strong>{activeBook?.title || 'Tenten'}</strong> para navegar em todas as páginas escaneadas reais:
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => quickFileInputRef.current?.click()}
+                  className="px-3 py-1 bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-white font-bold rounded-lg text-xs whitespace-nowrap transition-all shadow-md flex items-center gap-1.5 cursor-pointer"
+                >
+                  <UploadCloud className="w-3.5 h-3.5" />
+                  <span>Selecionar Arquivo PDF</span>
+                </button>
+              </div>
             </div>
           )}
 
@@ -455,63 +698,51 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
               <p className="text-xs text-red-300 leading-relaxed font-medium">{errorMsg}</p>
               <button
                 onClick={() => handlePageChange(currentPage)}
-                className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-xl text-xs font-bold transition-all shadow-md"
+                className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-xl text-xs font-bold transition-all shadow-md cursor-pointer"
               >
                 Tentar Recarregar Prancha
               </button>
             </div>
           ) : (
-            <>
-              {/* Demonstration Study Mode Banner */}
-              {activeBook && !activeBook.hasPdfOnDisk && (
-                <div className="mb-2 px-3 py-1.5 bg-orange-950/50 border border-orange-800/60 rounded-xl flex items-center justify-between gap-3 text-xs text-orange-200 w-full max-w-4xl shrink-0 shadow-md">
-                  <div className="flex items-center gap-2">
-                    <Info className="w-4 h-4 text-orange-400 shrink-0" />
-                    <span>Visualizando prancha de estudo estrutural. Deseja carregar o arquivo PDF completo de <strong>{activeBook.title}</strong> (sem limite de tamanho)?</span>
-                  </div>
-                  <button
-                    onClick={onOpenLibrary}
-                    className="px-2.5 py-1 bg-orange-600 hover:bg-orange-500 text-white font-bold rounded-lg text-[11px] whitespace-nowrap transition-colors shrink-0 shadow-sm"
-                  >
-                    + Fazer Upload PDF
-                  </button>
-                </div>
-              )}
+            <div 
+              className={`relative transition-all duration-150 flex items-center justify-center ${
+                fitMode === 'fit-screen'
+                  ? 'h-full w-full max-h-[calc(100vh-14rem)] flex items-center justify-center'
+                  : fitMode === 'fit-width'
+                  ? 'w-full max-w-4xl'
+                  : 'max-w-none'
+              }`}
+            >
+              {/* 1. Primary PDF Canvas (Renders real authentic scan with hardware acceleration) */}
+              <canvas
+                ref={canvasRef}
+                style={{
+                  display: hasLoadedPdf ? 'block' : 'none'
+                }}
+                className="rounded-lg shadow-2xl shadow-black border border-zinc-800/80 bg-white mx-auto block max-w-full"
+              />
 
-              <div 
-                className={`relative transition-all duration-150 flex items-center justify-center ${
-                  fitMode === 'fit-screen'
-                    ? 'h-full w-full max-h-[calc(100vh-14rem)] flex items-center justify-center'
-                    : fitMode === 'fit-width'
-                    ? 'w-full max-w-4xl'
-                    : 'max-w-none'
-                }`}
-              >
+              {/* 2. Fallback Vector Blueprint Image (Used when no raw PDF has been loaded yet) */}
+              {!hasLoadedPdf && (
                 <img
-                  ref={imageRef}
                   src={pageSrc}
                   alt={`Prancha #${currentPage} de ${activeBook?.title || 'Livro de Arte'}`}
-                  onLoad={() => setIsRenderingPage(false)}
-                  onError={() => {
-                    setIsRenderingPage(false);
-                    setErrorMsg(`Não foi possível carregar a prancha #${currentPage}. Tente outra página.`);
-                  }}
-                style={
-                  fitMode === 'custom-zoom'
-                    ? { width: `${zoomPercent}%`, maxWidth: 'none' }
-                    : undefined
-                }
-                className={`rounded-lg shadow-2xl shadow-black border border-zinc-800/80 bg-white ${
-                  fitMode === 'fit-screen'
-                    ? 'max-h-[calc(100vh-12.5rem)] w-auto object-contain block mx-auto'
-                    : fitMode === 'fit-width'
-                    ? 'w-full h-auto object-contain block'
-                    : 'block mx-auto'
-                }`}
-                loading="eager"
-              />
+                  style={
+                    fitMode === 'custom-zoom'
+                      ? { width: `${zoomPercent}%`, maxWidth: 'none' }
+                      : undefined
+                  }
+                  className={`rounded-lg shadow-2xl shadow-black border border-zinc-800/80 bg-white ${
+                    fitMode === 'fit-screen'
+                      ? 'max-h-[calc(100vh-14rem)] w-auto object-contain block mx-auto'
+                      : fitMode === 'fit-width'
+                      ? 'w-full h-auto object-contain block'
+                      : 'block mx-auto'
+                  }`}
+                  loading="eager"
+                />
+              )}
             </div>
-            </>
           )}
         </div>
 
@@ -519,12 +750,11 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
         {showAnalysisPanel && (
           <aside className="w-full sm:w-96 lg:w-[420px] bg-zinc-900/95 border-l border-zinc-800 flex flex-col shrink-0 overflow-hidden z-20 shadow-2xl">
             
-            {/* Header of analysis drawer */}
             <div className="p-3.5 border-b border-zinc-800 flex items-center justify-between bg-zinc-900">
               <div className="flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-orange-400" />
                 <h2 className="text-xs font-bold text-zinc-100 uppercase tracking-wider">
-                  Consulta & Tradução ES → PT
+                  Consulta &amp; Tradução ES → PT
                 </h2>
               </div>
               <div className="flex items-center gap-2">
@@ -533,7 +763,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                 </span>
                 <button
                   onClick={() => setShowAnalysisPanel(false)}
-                  className="text-zinc-500 hover:text-zinc-300 text-xs px-1.5 py-0.5"
+                  className="text-zinc-500 hover:text-zinc-300 text-xs px-1.5 py-0.5 cursor-pointer"
                 >
                   ✕
                 </button>
@@ -580,8 +810,6 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
               {/* Analysis Result Display */}
               {pageAnalysis && !isAnalyzing && (
                 <div className="space-y-4">
-                  
-                  {/* Summary Card */}
                   <div className="p-3.5 rounded-xl bg-zinc-950 border border-zinc-800 space-y-2">
                     <h3 className="text-xs font-bold text-orange-400">
                       {pageAnalysis.title || `Estudo da Prancha #${currentPage}`}
@@ -591,7 +819,6 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                     </p>
                   </div>
 
-                  {/* Identified Terms with ES -> PT Translations */}
                   {pageAnalysis.identifiedTerms && pageAnalysis.identifiedTerms.length > 0 && (
                     <div className="space-y-2">
                       <h4 className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">
@@ -624,56 +851,13 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                     </div>
                   )}
 
-                  {/* Structural Pipeline */}
-                  {pageAnalysis.structuralProcess && (
-                    <div className="space-y-2">
-                      <h4 className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">
-                        Etapas de Construção do Tenten
-                      </h4>
-                      <div className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 space-y-2 text-xs">
-                        {pageAnalysis.structuralProcess.gesture && (
-                          <div>
-                            <span className="font-bold text-orange-400">1. Gesto: </span>
-                            <span className="text-zinc-300">{pageAnalysis.structuralProcess.gesture}</span>
-                          </div>
-                        )}
-                        {pageAnalysis.structuralProcess.forms3D && (
-                          <div>
-                            <span className="font-bold text-orange-400">2. Volumes 3D: </span>
-                            <span className="text-zinc-300">{pageAnalysis.structuralProcess.forms3D}</span>
-                          </div>
-                        )}
-                        {pageAnalysis.structuralProcess.landmarks && (
-                          <div>
-                            <span className="font-bold text-orange-400">3. Marcos Ósseos: </span>
-                            <span className="text-zinc-300">{pageAnalysis.structuralProcess.landmarks}</span>
-                          </div>
-                        )}
-                        {pageAnalysis.structuralProcess.muscleFlows && (
-                          <div>
-                            <span className="font-bold text-orange-400">4. Fluxos Musculares: </span>
-                            <span className="text-zinc-300">{pageAnalysis.structuralProcess.muscleFlows}</span>
-                          </div>
-                        )}
-                        {pageAnalysis.structuralProcess.contourShading && (
-                          <div>
-                            <span className="font-bold text-orange-400">5. Hachuras Volumétricas: </span>
-                            <span className="text-zinc-300">{pageAnalysis.structuralProcess.contourShading}</span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* CTA button to practice */}
                   <button
                     onClick={handleOpenCanvas}
-                    className="w-full py-2.5 px-3 rounded-xl text-xs font-bold bg-orange-600 hover:bg-orange-500 text-white flex items-center justify-center gap-2 shadow-lg shadow-orange-950/40 transition-all"
+                    className="w-full py-2.5 px-3 rounded-xl text-xs font-bold bg-orange-600 hover:bg-orange-500 text-white flex items-center justify-center gap-2 shadow-lg shadow-orange-950/40 transition-all cursor-pointer"
                   >
                     <PenTool className="w-3.5 h-3.5" />
                     <span>Praticar Esta Prancha no Tablet com Stylus</span>
                   </button>
-
                 </div>
               )}
 
@@ -703,7 +887,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
 
           <button
             onClick={() => setShowThumbStrip(!showThumbStrip)}
-            className={`p-1 rounded text-xs transition-colors ${
+            className={`p-1 rounded text-xs transition-colors cursor-pointer ${
               showThumbStrip ? 'text-orange-400 bg-zinc-800' : 'text-zinc-500 hover:text-zinc-300'
             }`}
             title="Alternar fita de miniaturas"
@@ -719,7 +903,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
               <button
                 key={p}
                 onClick={() => handlePageChange(p)}
-                className={`relative shrink-0 rounded-lg overflow-hidden border transition-all ${
+                className={`relative shrink-0 rounded-lg overflow-hidden border transition-all cursor-pointer ${
                   currentPage === p
                     ? 'border-orange-500 ring-2 ring-orange-500/50 scale-105 shadow-md shadow-orange-950'
                     : 'border-zinc-800 opacity-60 hover:opacity-100 hover:border-zinc-600'

@@ -22,6 +22,7 @@ import {
   CheckCircle2
 } from 'lucide-react';
 import { ArtBook } from '../types/anatomy.ts';
+import { savePdfToIndexedDb, deletePdfFromIndexedDb } from '../utils/pdfStorage.ts';
 
 interface BookLibraryModalProps {
   isOpen: boolean;
@@ -180,6 +181,13 @@ export const BookLibraryModal: React.FC<BookLibraryModalProps> = ({
 
       const data = await res.json();
       if (data.book) {
+        // Cache PDF in browser IndexedDB for instant client rendering
+        try {
+          await savePdfToIndexedDb(data.book.id || targetBookId, selectedFile);
+        } catch (e) {
+          console.warn('Could not cache PDF in IndexedDB:', e);
+        }
+
         onBookUploaded(data.book);
         setUploadSuccessMsg(data.message || `Livro "${data.book.title}" atualizado com sucesso!`);
         setTimeout(() => {
@@ -201,6 +209,11 @@ export const BookLibraryModal: React.FC<BookLibraryModalProps> = ({
     setIsDeleting(true);
 
     try {
+      // Remove from browser IndexedDB cache
+      try {
+        await deletePdfFromIndexedDb(deletingBook.id);
+      } catch (e) {}
+
       const url = action === 'resetPdf' 
         ? `/api/books/${deletingBook.id}?action=resetPdf`
         : `/api/books/${deletingBook.id}`;

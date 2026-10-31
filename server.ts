@@ -693,20 +693,45 @@ function getAllBooks(): StoredBook[] {
 // In-flight renders map to avoid redundant duplicate Ghostscript calls
 const renderQueue = new Map<string, Promise<string>>();
 
-// Probe PDF page count using Ghostscript
+// Probe PDF page count using pure JS binary regex first, then Ghostscript if present
 function getPdfPageCount(filePath: string): Promise<number> {
   return new Promise((resolve) => {
-    const safePath = filePath.replace(/\\/g, '/');
-    const args = ['-q', '-dNODISPLAY', `--permit-file-read=${filePath}`, '-c', `(${safePath}) (r) file runpdfbegin pdfpagecount = quit`];
-    execFile('gs', args, { timeout: 10000 }, (error, stdout) => {
-      if (!error && stdout) {
-        const count = parseInt(stdout.trim(), 10);
-        if (!isNaN(count) && count > 0) {
-          return resolve(count);
+    // 1. Try fast pure JS regex parse from PDF buffer (works in any container without gs)
+    try {
+      if (fs.existsSync(filePath)) {
+        const buffer = fs.readFileSync(filePath);
+        const latinStr = buffer.toString('latin1');
+        const countMatches = [...latinStr.matchAll(/\/Count\s+(\d+)/g)];
+        if (countMatches.length > 0) {
+          const numbers = countMatches.map(m => parseInt(m[1], 10)).filter(n => !isNaN(n) && n > 0);
+          if (numbers.length > 0) {
+            const maxCount = Math.max(...numbers);
+            if (maxCount > 0 && maxCount < 10000) {
+              return resolve(maxCount);
+            }
+          }
         }
       }
-      resolve(100); // Safe fallback
-    });
+    } catch (e) {
+      console.warn('Fast regex page count failed:', e);
+    }
+
+    // 2. Try Ghostscript if available
+    try {
+      const safePath = filePath.replace(/\\/g, '/');
+      const args = ['-q', '-dNODISPLAY', `--permit-file-read=${filePath}`, '-c', `(${safePath}) (r) file runpdfbegin pdfpagecount = quit`];
+      execFile('gs', args, { timeout: 8000 }, (error, stdout) => {
+        if (!error && stdout) {
+          const count = parseInt(stdout.trim(), 10);
+          if (!isNaN(count) && count > 0) {
+            return resolve(count);
+          }
+        }
+        resolve(537);
+      });
+    } catch {
+      resolve(537);
+    }
   });
 }
 
@@ -1109,7 +1134,63 @@ app.post('/api/books/restore-defaults', (_req, res) => {
   });
 });
 
-// 4. Render or Serve Page for Any Book (Universal)
+// 5. Stream Raw PDF File with HTTP Range (206 Partial Content) for Browser PDF.js rendering
+app.get(['/api/books/:bookId/pdf', '/api/pdf/stream', '/api/pdf/download'], (req, res) => {
+  const bookId = req.params.bookId || (req.query.bookId as string) || 'tenten';
+  const allBooks = getAllBooks();
+  const book = allBooks.find(b => b.id === bookId) || allBooks[0];
+
+  let pdfPathToUse: string | null = null;
+  if (book?.filePath && fs.existsSync(book.filePath)) {
+    pdfPathToUse = book.filePath;
+  } else if (book?.filename && fs.existsSync(path.resolve(uploadedBooksDir, book.filename))) {
+    pdfPathToUse = path.resolve(uploadedBooksDir, book.filename);
+  }
+
+  // Also check if any file in uploadedBooksDir has bookId in name
+  if (!pdfPathToUse && fs.existsSync(uploadedBooksDir)) {
+    const files = fs.readdirSync(uploadedBooksDir);
+    const matched = files.find(f => f.toLowerCase().includes(bookId.toLowerCase()) && f.endsWith('.pdf'));
+    if (matched) {
+      pdfPathToUse = path.resolve(uploadedBooksDir, matched);
+    }
+  }
+
+  if (!pdfPathToUse || !fs.existsSync(pdfPathToUse)) {
+    return res.status(404).json({ error: 'Arquivo PDF não encontrado no servidor.' });
+  }
+
+  const stat = fs.statSync(pdfPathToUse);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = (end - start) + 1;
+    const fileStream = fs.createReadStream(pdfPathToUse, { start, end });
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'application/pdf',
+      'Cache-Control': 'public, max-age=86400',
+    });
+    fileStream.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'application/pdf',
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=86400',
+      'Content-Disposition': `inline; filename="${book?.filename || 'book.pdf'}"`,
+    });
+    fs.createReadStream(pdfPathToUse).pipe(res);
+  }
+});
+
+// 6. Render or Serve Page for Any Book (Universal)
 app.get(['/api/books/:bookId/page/:pageNum', '/api/pdf/page/:pageNum'], async (req, res) => {
   const bookId = req.params.bookId || (req.query.bookId as string) || 'tenten';
   const pageNum = parseInt(req.params.pageNum, 10);
