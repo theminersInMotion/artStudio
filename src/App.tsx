@@ -87,7 +87,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-orange-500 selection:text-white">
+    <div className="h-screen max-h-screen w-full overflow-hidden bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-orange-500 selection:text-white">
       
       {/* Universal Header with Navigation & Stylus Switch (Hidden when drawing in Clean Interface mode) */}
       {(!isCleanCanvasMode || activeTab !== 'canvas') && (

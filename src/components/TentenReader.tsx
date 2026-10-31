@@ -78,8 +78,40 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
   const renderTaskRef = useRef<any | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const quickFileInputRef = useRef<HTMLInputElement | null>(null);
-
   const totalPages = pdfDoc?.numPages || docPageCount || activeBook?.totalPages || 537;
+
+  // Viewport resize & orientation listener to recalculate canvas scale on mobile rotation
+  const [viewportDims, setViewportDims] = useState({
+    width: typeof window !== 'undefined' ? window.innerWidth : 800,
+    height: typeof window !== 'undefined' ? window.innerHeight : 600,
+  });
+
+  useEffect(() => {
+    let timeoutId: any;
+    const handleResize = () => {
+      clearTimeout(timeoutId);
+      // Immediate update
+      setViewportDims({
+        width: containerRef.current?.clientWidth || window.innerWidth,
+        height: containerRef.current?.clientHeight || window.innerHeight,
+      });
+      // Debounced update after orientation transition completes
+      timeoutId = setTimeout(() => {
+        setViewportDims({
+          width: containerRef.current?.clientWidth || window.innerWidth,
+          height: containerRef.current?.clientHeight || window.innerHeight,
+        });
+      }, 150);
+    };
+
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('orientationchange', handleResize);
+      clearTimeout(timeoutId);
+    };
+  }, []);
 
   // When active book changes, reset state
   useEffect(() => {
@@ -184,22 +216,52 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
         const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
         const baseViewport = page.getViewport({ scale: 1.0 });
 
-        let targetScale = 1.2;
+        // Available client area inside container
+        const availWidth = Math.max(180, (containerRef.current?.clientWidth || window.innerWidth) - 24);
+        const availHeight = Math.max(180, (containerRef.current?.clientHeight || (window.innerHeight - 150)) - 24);
+
+        let targetScale = 1.0;
         if (fitMode === 'fit-screen') {
-          const containerHeight = (containerRef.current?.clientHeight || 800) - 60;
-          targetScale = Math.max(0.7, containerHeight / baseViewport.height);
+          // Fit BOTH width and height so the page is never squashed or squeezed horizontally
+          const scaleW = availWidth / baseViewport.width;
+          const scaleH = availHeight / baseViewport.height;
+          targetScale = Math.min(scaleW, scaleH);
         } else if (fitMode === 'fit-width') {
-          const containerWidth = (containerRef.current?.clientWidth || 900) - 40;
-          targetScale = Math.max(0.7, containerWidth / baseViewport.width);
+          targetScale = availWidth / baseViewport.width;
         } else if (fitMode === 'custom-zoom') {
-          targetScale = (zoomPercent / 100) * 1.3;
+          const baseScale = Math.min(availWidth / baseViewport.width, availHeight / baseViewport.height);
+          targetScale = baseScale * (zoomPercent / 100);
         }
 
         const scaledViewport = page.getViewport({ scale: targetScale * dpr });
-        canvas.width = scaledViewport.width;
-        canvas.height = scaledViewport.height;
-        canvas.style.width = `${scaledViewport.width / dpr}px`;
-        canvas.style.height = `${scaledViewport.height / dpr}px`;
+        canvas.width = Math.round(scaledViewport.width);
+        canvas.height = Math.round(scaledViewport.height);
+
+        const displayW = Math.round(scaledViewport.width / dpr);
+        const displayH = Math.round(scaledViewport.height / dpr);
+
+        // Strict aspect ratio guarantee:
+        // Set both displayW and displayH matching scaledViewport, with objectFit: contain and max constraints
+        canvas.style.aspectRatio = `${baseViewport.width} / ${baseViewport.height}`;
+        if (fitMode === 'fit-screen') {
+          canvas.style.width = `${displayW}px`;
+          canvas.style.height = `${displayH}px`;
+          canvas.style.maxWidth = '100%';
+          canvas.style.maxHeight = '100%';
+          canvas.style.objectFit = 'contain';
+        } else if (fitMode === 'fit-width') {
+          canvas.style.width = `${displayW}px`;
+          canvas.style.height = `${displayH}px`;
+          canvas.style.maxWidth = '100%';
+          canvas.style.maxHeight = 'none';
+          canvas.style.objectFit = 'contain';
+        } else {
+          canvas.style.width = `${displayW}px`;
+          canvas.style.height = `${displayH}px`;
+          canvas.style.maxWidth = 'none';
+          canvas.style.maxHeight = 'none';
+          canvas.style.objectFit = 'contain';
+        }
 
         const renderContext = {
           canvasContext: ctx,
@@ -231,7 +293,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
         } catch {}
       }
     };
-  }, [pdfDoc, currentPage, fitMode, zoomPercent]);
+  }, [pdfDoc, currentPage, fitMode, zoomPercent, viewportDims]);
 
   // Handle Quick Direct Drag & Drop of PDF directly onto reader
   const handleQuickDropPdf = async (e: React.DragEvent) => {
@@ -418,7 +480,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
 
   return (
     <div 
-      className="flex-1 flex flex-col h-[calc(100vh-4rem)] bg-zinc-950 text-zinc-100 overflow-hidden select-none"
+      className="flex-1 flex flex-col min-h-0 bg-zinc-950 text-zinc-100 overflow-hidden select-none"
       onDragOver={(e) => e.preventDefault()}
       onDrop={handleQuickDropPdf}
     >
@@ -661,7 +723,7 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
         {/* Main Book Reader Display */}
         <div 
           ref={containerRef}
-          className="flex-1 overflow-auto bg-zinc-950/90 flex flex-col items-center justify-center p-2 sm:p-4 relative"
+          className="flex-1 overflow-auto bg-zinc-950/90 flex flex-col items-center justify-start sm:justify-center p-2 sm:p-4 relative min-h-0"
         >
           {(isRenderingPage || isPdfLoading) && (
             <div className="absolute inset-0 z-30 bg-black/40 backdrop-blur-[2px] flex flex-col items-center justify-center gap-2">
@@ -705,21 +767,19 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
             </div>
           ) : (
             <div 
-              className={`relative transition-all duration-150 flex items-center justify-center ${
-                fitMode === 'fit-screen'
-                  ? 'h-full w-full max-h-[calc(100vh-14rem)] flex items-center justify-center'
-                  : fitMode === 'fit-width'
+              className={`relative transition-all duration-150 flex items-center justify-center m-auto ${
+                fitMode === 'fit-width'
                   ? 'w-full max-w-4xl'
-                  : 'max-w-none'
+                  : 'max-w-full'
               }`}
             >
-              {/* 1. Primary PDF Canvas (Renders real authentic scan with hardware acceleration) */}
+              {/* 1. Primary PDF Canvas (Renders real authentic scan with hardware acceleration and perfect aspect ratio) */}
               <canvas
                 ref={canvasRef}
                 style={{
                   display: hasLoadedPdf ? 'block' : 'none'
                 }}
-                className="rounded-lg shadow-2xl shadow-black border border-zinc-800/80 bg-white mx-auto block max-w-full"
+                className="rounded-lg shadow-2xl shadow-black border border-zinc-800/80 bg-white mx-auto block max-w-full object-contain"
               />
 
               {/* 2. Fallback Vector Blueprint Image (Used when no raw PDF has been loaded yet) */}
@@ -734,10 +794,10 @@ export const TentenReader: React.FC<TentenReaderProps> = ({
                   }
                   className={`rounded-lg shadow-2xl shadow-black border border-zinc-800/80 bg-white ${
                     fitMode === 'fit-screen'
-                      ? 'max-h-[calc(100vh-14rem)] w-auto object-contain block mx-auto'
+                      ? 'max-h-[calc(100vh-14rem)] max-w-full w-auto h-auto object-contain block mx-auto'
                       : fitMode === 'fit-width'
-                      ? 'w-full h-auto object-contain block'
-                      : 'block mx-auto'
+                      ? 'w-full max-w-4xl h-auto object-contain block mx-auto'
+                      : 'block mx-auto max-w-full h-auto'
                   }`}
                   loading="eager"
                 />
